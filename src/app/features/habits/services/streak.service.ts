@@ -39,13 +39,23 @@ export class StreakService {
         this.streaks().reduce((sum, s) => sum + s.currentCount, 0)
     );
 
-    async loadStreaks(userId: string): Promise<void> {
+    /**
+     * Carga rachas desde SQLite (solo en native). En web retorna [].
+     * @param userId - ID del usuario
+     * @returns Lista de rachas
+     */
+    async getStreaks(userId: string): Promise<Streak[]> {
+        if (!this.sqlite.db) return [];
         const result = await this.sqlite.db.query(
             'SELECT * FROM streaks WHERE user_id = ?',
             [userId]
         );
-        this.streaks.set(result.values || []);
+        const list = (result.values || []) as Streak[];
+        this.streaks.set(list);
+        return list;
     }
 
-    // Implementation details would go here as per SKILL.md
+    async loadStreaks(userId: string): Promise<void> {
+        await this.getStreaks(userId);
+    }
 }

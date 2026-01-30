@@ -57,6 +57,7 @@ export class SyncService {
     }
 
     async queueOperation(operation: SyncOperation): Promise<void> {
+        if (!this.sqlite.db) return;
         await this.sqlite.db.run(
             `INSERT INTO sync_queue (operation, table_name, record_id, payload)
        VALUES (?, ?, ?, ?)`,
@@ -91,6 +92,7 @@ export class SyncService {
     }
 
     private async getPendingQueue(): Promise<any[]> {
+        if (!this.sqlite.db) return [];
         const result = await this.sqlite.db.query(
             `SELECT * FROM sync_queue 
        WHERE retry_count < max_retries 
@@ -149,6 +151,7 @@ export class SyncService {
     }
 
     private async markAsSynced(tableName: string, recordId: string): Promise<void> {
+        if (!this.sqlite.db) return;
         await this.sqlite.db.run(
             `UPDATE ${tableName} 
        SET synced = 1 
@@ -158,6 +161,7 @@ export class SyncService {
     }
 
     private async removeFromQueue(queueId: number): Promise<void> {
+        if (!this.sqlite.db) return;
         await this.sqlite.db.run(
             'DELETE FROM sync_queue WHERE id = ?',
             [queueId]
@@ -165,6 +169,7 @@ export class SyncService {
     }
 
     private async handleSyncError(queueItem: any, error: any): Promise<void> {
+        if (!this.sqlite.db) return;
         const newRetryCount = queueItem.retry_count + 1;
 
         await this.sqlite.db.run(
@@ -176,6 +181,10 @@ export class SyncService {
     }
 
     private async updatePendingCount(): Promise<void> {
+        if (!this.sqlite.db) {
+            this.pendingOperations.set(0);
+            return;
+        }
         const result = await this.sqlite.db.query(
             'SELECT COUNT(*) as count FROM sync_queue'
         );

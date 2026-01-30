@@ -6,14 +6,34 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Dark Neon Glass – Design tokens (see .cursor/rules/ui-dark-neon-glass.mdc) */
 :root {
-  --primary-color: #6366f1;
-  --surface-ground: #0f172a; // Dark background
-  --text-color: #e2e8f0;
+  --bg-void: #050505;
+  --bg-surface: rgba(24, 24, 27, 0.5);
+  --bg-active: rgba(39, 39, 42, 0.8);
+  --accent-primary: 139 92 246; /* violet-500 */
+  --accent-success: 16 185 129; /* emerald-500 */
+  --accent-alert: 225 29 72;   /* rose-600 */
+  --border-default: rgba(255, 255, 255, 0.1);
+  --border-active: rgba(139, 92, 246, 0.5);
+  /* PrimeNG overrides to align with AION Neon */
+  --primary-color: #7c3aed;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --danger-color: #e11d48;
+  --surface-ground: var(--bg-void);
+  --text-color: #fafafa;
+  --text-color-secondary: rgba(255, 255, 255, 0.6);
 }
 
+$spacing-xs: 4px;
+$spacing-sm: 8px;
+$spacing-md: 16px;
+$spacing-lg: 24px;
+$spacing-xl: 32px;
+
 body {
-  background-color: var(--surface-ground);
+  background-color: var(--bg-void);
   color: var(--text-color);
   margin: 0;
   font-family: var(--font-family);

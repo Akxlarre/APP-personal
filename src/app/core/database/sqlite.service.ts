@@ -4,17 +4,20 @@ import { Capacitor } from '@capacitor/core';
 
 @Injectable({ providedIn: 'root' })
 export class SQLiteService {
-    private sqlite: SQLiteConnection;
+    private sqlite!: SQLiteConnection;
     public db!: SQLiteDBConnection;
     private platform: string;
 
     constructor() {
         this.platform = Capacitor.getPlatform();
-        this.sqlite = new SQLiteConnection(CapacitorSQLite);
     }
 
     async init() {
+        if (this.platform === 'web') {
+            return;
+        }
         try {
+            this.sqlite = new SQLiteConnection(CapacitorSQLite);
             this.db = await this.sqlite.createConnection(
                 'lifeblocks',
                 false,
@@ -33,8 +36,51 @@ export class SQLiteService {
 
     private async createTables() {
         const schema = `
+      CREATE TABLE IF NOT EXISTS templates (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        is_active INTEGER DEFAULT 1,
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_templates_user ON templates(user_id);
+
+      CREATE TABLE IF NOT EXISTS blocks (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        start_time TEXT NOT NULL,
+        end_time TEXT NOT NULL,
+        description TEXT,
+        is_critical INTEGER DEFAULT 0,
+        is_shared INTEGER DEFAULT 0,
+        category TEXT DEFAULT 'work',
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (template_id) REFERENCES templates(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_blocks_template ON blocks(template_id);
+
+      CREATE TABLE IF NOT EXISTS daily_schedule (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (template_id) REFERENCES templates(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_schedule_user_date ON daily_schedule(user_id, date);
+
       CREATE TABLE IF NOT EXISTS daily_blocks (
         id TEXT PRIMARY KEY,
+        schedule_id TEXT,
+        original_block_id TEXT,
         user_id TEXT NOT NULL,
         date TEXT NOT NULL,
         name TEXT NOT NULL,
@@ -49,9 +95,9 @@ export class SQLiteService {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       );
-      
       CREATE INDEX IF NOT EXISTS idx_blocks_date ON daily_blocks(date);
       CREATE INDEX IF NOT EXISTS idx_blocks_sync ON daily_blocks(synced);
+      CREATE INDEX IF NOT EXISTS idx_blocks_schedule ON daily_blocks(schedule_id);
       
       CREATE TABLE IF NOT EXISTS sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,9 +144,71 @@ export class SQLiteService {
         earned_at TEXT DEFAULT CURRENT_TIMESTAMP,
         metadata TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS shared_blocks (
+        id TEXT PRIMARY KEY,
+        block_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        invited_user_id TEXT NOT NULL,
+        role TEXT,
+        status TEXT DEFAULT 'pending',
+        confirmed_attendance INTEGER DEFAULT 0,
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_shared_blocks_invited ON shared_blocks(invited_user_id);
+
+      CREATE TABLE IF NOT EXISTS inventory_items (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        unit TEXT NOT NULL,
+        last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_inventory_user ON inventory_items(user_id);
+
+      CREATE TABLE IF NOT EXISTS meal_suggestions (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        required_items TEXT NOT NULL,
+        category TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS turn_schedule (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        partner_id TEXT NOT NULL,
+        week_start TEXT NOT NULL,
+        turn_type TEXT NOT NULL,
+        exceptions TEXT,
+        synced INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_turn_schedule_user ON turn_schedule(user_id);
     `;
 
         await this.db.execute(schema);
+        await this.migrateDailyBlocksAddScheduleColumns();
+    }
+
+    private async migrateDailyBlocksAddScheduleColumns(): Promise<void> {
+        const columns = ['schedule_id', 'original_block_id'];
+        for (const col of columns) {
+            try {
+                await this.db.run(`ALTER TABLE daily_blocks ADD COLUMN ${col} TEXT`);
+            } catch {
+                // Column already exists
+            }
+        }
     }
 
     async getUnsyncedBlocks(): Promise<any[]> {

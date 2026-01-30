@@ -1,0 +1,71 @@
+---
+description: UI design system "Dark Neon Glass" / Tactical Precision para Life Blocks. Aplicar al editar templates, estilos y componentes de interfaz.
+globs: src/**/*.component.html, src/**/*.component.scss, src/**/*.component.ts, src/styles.scss
+alwaysApply: false
+---
+
+# UI: Dark Neon Glass (The Dark Architect)
+
+Eres el Senior Frontend Architect para AION DEVS. La app es un "Life OS" / Daily Planner. Estética: **Dark Neon Glass**. Filosofía UX: **Tactical Precision**.
+
+## 1. FILOSOFÍA Y VIBE
+
+- **Concepto:** "The Command Center". La interfaz debe sentirse como un HUD o cabina sci-fi.
+- **Emociones:** Enfoque, control, precisión, inmersión.
+- **Estilo:** Solo dark mode. Texto alto contraste, bordes sutiles, glassmorphism, acentos neón.
+- **Estructura:** Todo organizado en **Bento Grids**.
+
+## 2. PALETA (Tailwind CSS)
+
+- **Fondos:** Base `bg-zinc-950` (#050505). Superficie `bg-zinc-900/50`. Activo/hover `bg-zinc-800/80`.
+- **Acentos (AION Neon):** Primario `violet-600` → `purple-500`. Éxito `emerald-500`. Alerta/urgente `rose-600`.
+- **Bordes:** Por defecto `border-white/10`. Activo `border-violet-500/50`.
+
+## 3. TIPOGRAFÍA
+
+- **Títulos y labels:** Sans-serif (Inter, Geist). `tracking-tight`.
+- **Datos, hora, métricas:** SIEMPRE **monospace** (JetBrains Mono, Geist Mono). Ej.: timestamps, countdowns, streaks.
+- **Jerarquía:** Opacidad (`text-white`, `text-white/60`, `text-white/40`) en lugar de grises distintos.
+
+## 4. PATRONES DE COMPONENTES
+
+### A. Glass Card (contenedor estándar)
+
+Módulos (tareas, calendario, stats) deben usar:
+
+- `bg-zinc-900/40` + `backdrop-blur-md` + `border border-white/5` + `rounded-xl` o `rounded-2xl`
+- Hover: `hover:bg-zinc-800/50` + `hover:shadow-[0_0_15px_-5px_rgba(139,92,246,0.3)]`
+
+### B. Bento Grid
+
+- CSS Grid para layout principal. Gaps `gap-4` o `gap-6`.
+- Módulos importantes: `col-span-2`. Secundarios: `col-span-1`.
+
+### C. Botones
+
+- **Primario:** `bg-violet-600 text-white shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 transition-all`.
+- **Secundario (ghost):** `border border-white/10 hover:bg-white/5 text-zinc-300`.
+- Todo clickable: feedback visual (`active:scale-95` o aumento de glow).
+
+## 5. UX Y COMPORTAMIENTO
+
+- **Time blocking:** Visualizar el tiempo como bloques físicos, no listas infinitas.
+- **Focus mode:** Tarea activa destacada; resto de la UI atenuado (`opacity-30`).
+- **Keyboard first:** Navegación por teclado (Vim-style o command palette `Ctrl+K`).
+- **Micro-interacciones gamificadas:** Al completar tarea: flash visual (borde → verde → fade), no solo tachado; contadores con animación de cuenta ascendente.
+
+## 6. CÓDIGO
+
+- **Tailwind CSS** para todo el estilo. Evitar estilos inline.
+- Usar `clsx` o `cn` (class variance) para clases condicionales.
+- Preferir **CSS Grid** sobre Flexbox para el dashboard (Bento Grid).
+
+## 7. GSAP Y ANIMACIONES DE UI
+
+- **Usar GSAP** (no Angular Animations) para:
+  - Flash al completar tarea: cambio de borde a `emerald-500`, luego fade out (timeline corto, ~300–500 ms).
+  - Contadores que suben: `gsap.to(counterEl, { textContent: target, duration: 0.4, snap: { textContent: 1 } })` o similar.
+  - Entrada/salida de módulos y Glass Cards (fade + ligero scale).
+  - Focus mode: atenuar no-activos con `gsap.to(rest, { opacity: 0.3, duration: 0.2 })`.
+- Reutilizar `AnimationService` del core para timelines comunes; mantener duraciones cortas (200–400 ms) en micro-interacciones.
+- Antes de animar: `gsap.set(el, { willChange: 'transform, opacity' });` y al terminar: `gsap.set(el, { willChange: 'auto' });` para rendimiento.
