@@ -1,0 +1,976 @@
+---
+name: supabase-offline-sync
+description: Patrones de sincronización offline-first con Supabase, SQLite local y resolución de conflictos. Úsalo cuando implementes sync de datos, manejes estados offline, o resuelvas conflictos de escritura concurrente.
+---
+
+# Supabase Offline-First Sync Patterns
+
+Estrategias probadas para sincronización bidireccional entre SQLite local y Supabase PostgreSQL, con manejo de conflictos y queue de operaciones.
+
+## Cuándo Usar Esta Skill
+
+- Implementar arquitectura offline-first
+- Sincronizar datos entre dispositivo y cloud
+- Resolver conflictos de escritura concurrente
+- Implementar queue de operaciones pendientes
+- Manejar reconexión automática
+
+## Arquitectura de Sincronización
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      USER INTERACTION                        │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│  1. LOCAL WRITE (SQLite)                                     │
+│     • Actualización instantánea                              │
+│     • Flag synced = 0                                        │
+│     • Timestamp local_updated_at                             │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│  2. SYNC QUEUE                                               │
+│     • Insertar en tabla sync_queue                           │
+│     • Operación: INSERT | UPDATE | DELETE                    │
+│     • Retry count: 0                                         │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                    ┌───────┴────────┐
+                    │  ¿Online?      │
+                    └───┬────────┬───┘
+                       NO       YES
+                        │        │
+                        │        ▼
+                        │   ┌──────────────────────────────────┐
+                        │   │  3. PUSH TO SUPABASE             │
+                        │   │     • Ejecutar operación         │
+                        │   │     • Obtener server timestamp   │
+                        │   └───────────┬──────────────────────┘
+                        │               │
+                        │               ▼
+                        │   ┌──────────────────────────────────┐
+                        │   │  4. CONFLICT RESOLUTION          │
+                        │   │     • Si server_ts > local_ts    │
+                        │   │       → Merge estrategia         │
+                        │   └───────────┬──────────────────────┘
+                        │               │
+                        │               ▼
+                        │   ┌──────────────────────────────────┐
+                        │   │  5. UPDATE LOCAL                 │
+                        │   │     • Actualizar con server data │
+                        │   │     • Flag synced = 1            │
+                        │   │     • Remover de sync_queue      │
+                        │   └──────────────────────────────────┘
+                        │
+                        └─────> Permanece en queue
+                                (retry on reconnect)
+```
+
+## Schema Local (SQLite)
+
+```sql
+-- Tabla principal con metadatos de sync
+CREATE TABLE daily_blocks (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  name TEXT NOT NULL,
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  completion_note TEXT,
+  completed_at TEXT,
+  
+  -- Metadatos de sincronización
+  synced INTEGER DEFAULT 0,              -- 0 = pendiente, 1 = sincronizado
+  local_updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  server_updated_at TEXT,                -- Timestamp del servidor
+  conflict_version INTEGER DEFAULT 1,    -- Para detección de conflictos
+  
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_blocks_sync ON daily_blocks(synced);
+CREATE INDEX idx_blocks_date ON daily_blocks(date);
+CREATE INDEX idx_blocks_user_date ON daily_blocks(user_id, date);
+
+-- Triggers para actualizar updated_at
+CREATE TRIGGER update_blocks_timestamp 
+AFTER UPDATE ON daily_blocks
+BEGIN
+  UPDATE daily_blocks 
+  SET updated_at = CURRENT_TIMESTAMP 
+  WHERE id = NEW.id;
+END;
+
+-- Cola de operaciones pendientes
+CREATE TABLE sync_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation TEXT NOT NULL,        -- 'INSERT' | 'UPDATE' | 'DELETE'
+  table_name TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  payload TEXT NOT NULL,          -- JSON serializado
+  retry_count INTEGER DEFAULT 0,
+  max_retries INTEGER DEFAULT 3,
+  last_error TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_sync_queue_table ON sync_queue(table_name);
+
+-- Tabla de conflictos detectados (para revisión manual)
+CREATE TABLE sync_conflicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  local_data TEXT NOT NULL,       -- JSON del dato local
+  server_data TEXT NOT NULL,      -- JSON del dato del servidor
+  resolution_strategy TEXT,       -- 'local_wins' | 'server_wins' | 'manual'
+  resolved INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+## Schema Supabase (PostgreSQL)
+
+```sql
+-- Extensiones necesarias
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Tabla en Supabase (espejo de local con RLS)
+CREATE TABLE daily_blocks (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  name TEXT NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  status TEXT DEFAULT 'pending',
+  completion_note TEXT,
+  completed_at TIMESTAMPTZ,
+  
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Índices para performance
+CREATE INDEX idx_blocks_user_date ON daily_blocks(user_id, date);
+CREATE INDEX idx_blocks_status ON daily_blocks(status);
+
+-- Trigger para updated_at
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_blocks_updated_at
+BEFORE UPDATE ON daily_blocks
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+-- Row Level Security
+ALTER TABLE daily_blocks ENABLE ROW LEVEL SECURITY;
+
+-- Política: Users solo ven sus propios bloques
+CREATE POLICY "Users can view own blocks"
+  ON daily_blocks
+  FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Política: Users pueden insertar sus bloques
+CREATE POLICY "Users can insert own blocks"
+  ON daily_blocks
+  FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+-- Política: Users pueden actualizar sus bloques
+CREATE POLICY "Users can update own blocks"
+  ON daily_blocks
+  FOR UPDATE
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- Política: Users pueden eliminar sus bloques
+CREATE POLICY "Users can delete own blocks"
+  ON daily_blocks
+  FOR DELETE
+  USING (auth.uid() = user_id);
+
+-- Política: Ver bloques compartidos (donde estoy invitado)
+CREATE POLICY "Users can view shared blocks"
+  ON daily_blocks
+  FOR SELECT
+  USING (
+    id IN (
+      SELECT block_id 
+      FROM shared_blocks 
+      WHERE invited_user_id = auth.uid() 
+        AND status = 'accepted'
+    )
+  );
+```
+
+## Servicio de Sincronización (Angular)
+
+```typescript
+// src/app/core/sync/sync.service.ts
+import { Injectable, inject, signal } from '@angular/core';
+import { SQLiteService } from '../database/sqlite.service';
+import { SupabaseService } from '../supabase/supabase.service';
+import { NetworkService } from '../network/network.service';
+import { interval, merge } from 'rxjs';
+import { filter, switchMap, tap } from 'rxjs/operators';
+
+export type SyncStatus = 'idle' | 'syncing' | 'conflict' | 'error';
+
+export interface SyncOperation {
+  operation: 'INSERT' | 'UPDATE' | 'DELETE';
+  tableName: string;
+  recordId: string;
+  payload: any;
+  retryCount?: number;
+}
+
+@Injectable({ providedIn: 'root' })
+export class SyncService {
+  private sqlite = inject(SQLiteService);
+  private supabase = inject(SupabaseService);
+  private network = inject(NetworkService);
+  
+  // Estado de sincronización
+  syncStatus = signal<SyncStatus>('idle');
+  lastSyncTime = signal<Date | null>(null);
+  pendingOperations = signal<number>(0);
+  
+  // Intervalo de sincronización (30 segundos)
+  private syncInterval$ = interval(30000);
+  
+  // Observador de cambios de red
+  private networkChanges$ = this.network.onlineChanges$;
+  
+  constructor() {
+    this.initAutoSync();
+  }
+  
+  /**
+   * Inicializar sincronización automática
+   */
+  private initAutoSync() {
+    merge(
+      this.syncInterval$,
+      this.networkChanges$.pipe(filter(online => online))
+    )
+      .pipe(
+        filter(() => this.network.isOnline()),
+        tap(() => this.syncStatus.set('syncing')),
+        switchMap(() => this.syncAllPendingOperations())
+      )
+      .subscribe({
+        next: () => {
+          this.syncStatus.set('idle');
+          this.lastSyncTime.set(new Date());
+        },
+        error: (error) => {
+          console.error('Auto-sync failed', error);
+          this.syncStatus.set('error');
+        }
+      });
+  }
+  
+  /**
+   * Encolar operación de sincronización
+   */
+  async queueOperation(operation: SyncOperation): Promise<void> {
+    await this.sqlite.db.run(
+      `INSERT INTO sync_queue (operation, table_name, record_id, payload)
+       VALUES (?, ?, ?, ?)`,
+      [
+        operation.operation,
+        operation.tableName,
+        operation.recordId,
+        JSON.stringify(operation.payload)
+      ]
+    );
+    
+    // Actualizar contador
+    this.updatePendingCount();
+    
+    // Intentar sync inmediato si estamos online
+    if (this.network.isOnline()) {
+      this.syncAllPendingOperations();
+    }
+  }
+  
+  /**
+   * Sincronizar todas las operaciones pendientes
+   */
+  async syncAllPendingOperations(): Promise<void> {
+    const queue = await this.getPendingQueue();
+    
+    for (const item of queue) {
+      try {
+        await this.executeQueueItem(item);
+        await this.removeFromQueue(item.id);
+      } catch (error) {
+        await this.handleSyncError(item, error);
+      }
+    }
+    
+    this.updatePendingCount();
+  }
+  
+  /**
+   * Obtener cola de operaciones pendientes
+   */
+  private async getPendingQueue(): Promise<any[]> {
+    const result = await this.sqlite.db.query(
+      `SELECT * FROM sync_queue 
+       WHERE retry_count < max_retries 
+       ORDER BY created_at ASC`
+    );
+    
+    return result.values || [];
+  }
+  
+  /**
+   * Ejecutar operación de la cola
+   */
+  private async executeQueueItem(item: any): Promise<void> {
+    const { operation, table_name, record_id, payload } = item;
+    const data = JSON.parse(payload);
+    
+    switch (operation) {
+      case 'INSERT':
+        await this.syncInsert(table_name, data);
+        break;
+      case 'UPDATE':
+        await this.syncUpdate(table_name, record_id, data);
+        break;
+      case 'DELETE':
+        await this.syncDelete(table_name, record_id);
+        break;
+    }
+  }
+  
+  /**
+   * Sincronizar INSERT
+   */
+  private async syncInsert(tableName: string, data: any): Promise<void> {
+    const { error } = await this.supabase
+      .from(tableName)
+      .insert(data);
+    
+    if (error) throw error;
+    
+    // Marcar como sincronizado en local
+    await this.markAsSynced(tableName, data.id);
+  }
+  
+  /**
+   * Sincronizar UPDATE con detección de conflictos
+   */
+  private async syncUpdate(
+    tableName: string, 
+    recordId: string, 
+    localData: any
+  ): Promise<void> {
+    // 1. Obtener versión actual del servidor
+    const { data: serverData, error: fetchError } = await this.supabase
+      .from(tableName)
+      .select('*, updated_at')
+      .eq('id', recordId)
+      .single();
+    
+    if (fetchError) throw fetchError;
+    
+    // 2. Detectar conflicto (si hay cambios en servidor)
+    const localTimestamp = new Date(localData.local_updated_at);
+    const serverTimestamp = new Date(serverData.updated_at);
+    
+    if (serverTimestamp > localTimestamp) {
+      // CONFLICTO DETECTADO
+      await this.handleConflict(tableName, recordId, localData, serverData);
+      return;
+    }
+    
+    // 3. No hay conflicto, proceder con update
+    const { error: updateError } = await this.supabase
+      .from(tableName)
+      .update(localData)
+      .eq('id', recordId);
+    
+    if (updateError) throw updateError;
+    
+    // 4. Actualizar timestamp del servidor en local
+    await this.updateServerTimestamp(tableName, recordId, new Date());
+    await this.markAsSynced(tableName, recordId);
+  }
+  
+  /**
+   * Sincronizar DELETE
+   */
+  private async syncDelete(tableName: string, recordId: string): Promise<void> {
+    const { error } = await this.supabase
+      .from(tableName)
+      .delete()
+      .eq('id', recordId);
+    
+    if (error) throw error;
+  }
+  
+  /**
+   * Manejar conflicto de sincronización
+   */
+  private async handleConflict(
+    tableName: string,
+    recordId: string,
+    localData: any,
+    serverData: any
+  ): Promise<void> {
+    // Registrar conflicto
+    await this.sqlite.db.run(
+      `INSERT INTO sync_conflicts 
+       (table_name, record_id, local_data, server_data, resolution_strategy)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        tableName,
+        recordId,
+        JSON.stringify(localData),
+        JSON.stringify(serverData),
+        'server_wins' // Estrategia por defecto
+      ]
+    );
+    
+    // Estrategia de resolución: Server Wins (por ahora)
+    // TODO: Implementar estrategias más sofisticadas
+    await this.applyServerData(tableName, recordId, serverData);
+    
+    this.syncStatus.set('conflict');
+  }
+  
+  /**
+   * Aplicar datos del servidor (sobrescribir local)
+   */
+  private async applyServerData(
+    tableName: string,
+    recordId: string,
+    serverData: any
+  ): Promise<void> {
+    const columns = Object.keys(serverData).join(', ');
+    const placeholders = Object.keys(serverData).map(() => '?').join(', ');
+    const values = Object.values(serverData);
+    
+    await this.sqlite.db.run(
+      `UPDATE ${tableName} 
+       SET ${columns} = ${placeholders}, 
+           synced = 1,
+           server_updated_at = ?
+       WHERE id = ?`,
+      [...values, new Date().toISOString(), recordId]
+    );
+  }
+  
+  /**
+   * Marcar registro como sincronizado
+   */
+  private async markAsSynced(tableName: string, recordId: string): Promise<void> {
+    await this.sqlite.db.run(
+      `UPDATE ${tableName} 
+       SET synced = 1, server_updated_at = ? 
+       WHERE id = ?`,
+      [new Date().toISOString(), recordId]
+    );
+  }
+  
+  /**
+   * Actualizar timestamp del servidor en local
+   */
+  private async updateServerTimestamp(
+    tableName: string,
+    recordId: string,
+    timestamp: Date
+  ): Promise<void> {
+    await this.sqlite.db.run(
+      `UPDATE ${tableName} 
+       SET server_updated_at = ? 
+       WHERE id = ?`,
+      [timestamp.toISOString(), recordId]
+    );
+  }
+  
+  /**
+   * Remover ítem de la cola
+   */
+  private async removeFromQueue(queueId: number): Promise<void> {
+    await this.sqlite.db.run(
+      'DELETE FROM sync_queue WHERE id = ?',
+      [queueId]
+    );
+  }
+  
+  /**
+   * Manejar error de sincronización
+   */
+  private async handleSyncError(queueItem: any, error: any): Promise<void> {
+    const newRetryCount = queueItem.retry_count + 1;
+    
+    await this.sqlite.db.run(
+      `UPDATE sync_queue 
+       SET retry_count = ?, last_error = ? 
+       WHERE id = ?`,
+      [newRetryCount, error.message, queueItem.id]
+    );
+    
+    if (newRetryCount >= queueItem.max_retries) {
+      console.error(`Max retries reached for queue item ${queueItem.id}`, error);
+      // Mover a tabla de errores permanentes
+      await this.moveToFailedQueue(queueItem);
+    }
+  }
+  
+  /**
+   * Mover operación fallida a tabla de errores
+   */
+  private async moveToFailedQueue(queueItem: any): Promise<void> {
+    // TODO: Implementar tabla failed_sync_operations
+    console.error('Operation permanently failed', queueItem);
+  }
+  
+  /**
+   * Actualizar contador de operaciones pendientes
+   */
+  private async updatePendingCount(): Promise<void> {
+    const result = await this.sqlite.db.query(
+      'SELECT COUNT(*) as count FROM sync_queue'
+    );
+    
+    this.pendingOperations.set(result.values?.[0]?.count || 0);
+  }
+  
+  /**
+   * Forzar sincronización manual
+   */
+  async forceSyncNow(): Promise<void> {
+    if (!this.network.isOnline()) {
+      throw new Error('No hay conexión a internet');
+    }
+    
+    this.syncStatus.set('syncing');
+    await this.syncAllPendingOperations();
+    this.syncStatus.set('idle');
+    this.lastSyncTime.set(new Date());
+  }
+  
+  /**
+   * Obtener conflictos no resueltos
+   */
+  async getUnresolvedConflicts(): Promise<any[]> {
+    const result = await this.sqlite.db.query(
+      'SELECT * FROM sync_conflicts WHERE resolved = 0'
+    );
+    
+    return result.values || [];
+  }
+  
+  /**
+   * Resolver conflicto manualmente
+   */
+  async resolveConflict(
+    conflictId: number,
+    strategy: 'local_wins' | 'server_wins'
+  ): Promise<void> {
+    const conflict = await this.sqlite.db.query(
+      'SELECT * FROM sync_conflicts WHERE id = ?',
+      [conflictId]
+    );
+    
+    if (!conflict.values || conflict.values.length === 0) {
+      throw new Error('Conflict not found');
+    }
+    
+    const { table_name, record_id, local_data, server_data } = conflict.values[0];
+    
+    if (strategy === 'local_wins') {
+      // Forzar push de datos locales
+      await this.syncUpdate(table_name, record_id, JSON.parse(local_data));
+    } else {
+      // Aplicar datos del servidor
+      await this.applyServerData(table_name, record_id, JSON.parse(server_data));
+    }
+    
+    // Marcar conflicto como resuelto
+    await this.sqlite.db.run(
+      'UPDATE sync_conflicts SET resolved = 1 WHERE id = ?',
+      [conflictId]
+    );
+  }
+}
+```
+
+## Repository Pattern con Sync
+
+```typescript
+// src/app/features/blocks/services/blocks.repository.ts
+@Injectable({ providedIn: 'root' })
+export class BlocksRepository {
+  private sqlite = inject(SQLiteService);
+  private supabase = inject(SupabaseService);
+  private sync = inject(SyncService);
+  private network = inject(NetworkService);
+  
+  /**
+   * Obtener bloques del día (offline-first)
+   */
+  async getDailyBlocks(userId: string, date: string): Promise<DailyBlock[]> {
+    // 1. Intentar fetch de servidor si estamos online
+    if (this.network.isOnline()) {
+      try {
+        const { data, error } = await this.supabase
+          .from('daily_blocks')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('date', date)
+          .order('start_time', { ascending: true });
+        
+        if (!error && data) {
+          // Guardar en cache local
+          await this.cacheBlocks(data);
+          return data;
+        }
+      } catch (error) {
+        console.warn('Failed to fetch from server, using cache', error);
+      }
+    }
+    
+    // 2. Fallback a SQLite local
+    const result = await this.sqlite.db.query(
+      `SELECT * FROM daily_blocks 
+       WHERE user_id = ? AND date = ? 
+       ORDER BY start_time ASC`,
+      [userId, date]
+    );
+    
+    return result.values || [];
+  }
+  
+  /**
+   * Completar bloque (write local + queue sync)
+   */
+  async completeBlock(blockId: string, note?: string): Promise<void> {
+    const completedAt = new Date().toISOString();
+    
+    // 1. Actualizar local PRIMERO (instant UI update)
+    await this.sqlite.db.run(
+      `UPDATE daily_blocks 
+       SET status = 'completed',
+           completion_note = ?,
+           completed_at = ?,
+           synced = 0,
+           local_updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [note || null, completedAt, blockId]
+    );
+    
+    // 2. Encolar operación de sync
+    await this.sync.queueOperation({
+      operation: 'UPDATE',
+      tableName: 'daily_blocks',
+      recordId: blockId,
+      payload: {
+        id: blockId,
+        status: 'completed',
+        completion_note: note,
+        completed_at: completedAt
+      }
+    });
+  }
+  
+  /**
+   * Crear nuevo bloque
+   */
+  async createBlock(block: Partial<DailyBlock>): Promise<DailyBlock> {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    
+    const newBlock: DailyBlock = {
+      id,
+      ...block,
+      status: 'pending',
+      created_at: now,
+      updated_at: now
+    } as DailyBlock;
+    
+    // 1. Insertar en local
+    await this.sqlite.db.run(
+      `INSERT INTO daily_blocks 
+       (id, user_id, date, name, start_time, end_time, status, synced)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+      [
+        id,
+        newBlock.user_id,
+        newBlock.date,
+        newBlock.name,
+        newBlock.start_time,
+        newBlock.end_time,
+        newBlock.status
+      ]
+    );
+    
+    // 2. Encolar sync
+    await this.sync.queueOperation({
+      operation: 'INSERT',
+      tableName: 'daily_blocks',
+      recordId: id,
+      payload: newBlock
+    });
+    
+    return newBlock;
+  }
+  
+  /**
+   * Cachear bloques en SQLite
+   */
+  private async cacheBlocks(blocks: DailyBlock[]): Promise<void> {
+    for (const block of blocks) {
+      await this.sqlite.db.run(
+        `INSERT OR REPLACE INTO daily_blocks 
+         (id, user_id, date, name, start_time, end_time, status, 
+          completion_note, completed_at, synced, server_updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        [
+          block.id,
+          block.user_id,
+          block.date,
+          block.name,
+          block.start_time,
+          block.end_time,
+          block.status,
+          block.completion_note,
+          block.completed_at,
+          block.updated_at
+        ]
+      );
+    }
+  }
+}
+```
+
+## Componente de Estado de Sync
+
+```typescript
+// src/app/shared/components/sync-status/sync-status.component.ts
+@Component({
+  selector: 'app-sync-status',
+  standalone: true,
+  imports: [CommonModule, BadgeModule],
+  template: `
+    <div class="sync-status" [class]="syncStatus()">
+      @switch (syncStatus()) {
+        @case ('syncing') {
+          <p-badge 
+            value="Sincronizando..." 
+            severity="info"
+            [styleClass]="'animate-pulse'"
+          />
+        }
+        @case ('idle') {
+          @if (pendingOps() > 0) {
+            <p-badge 
+              [value]="pendingOps() + ' pendientes'"
+              severity="warning"
+            />
+          } @else {
+            <p-badge 
+              value="✓ Sincronizado"
+              severity="success"
+            />
+          }
+        }
+        @case ('conflict') {
+          <p-badge 
+            value="Conflicto detectado"
+            severity="danger"
+            (click)="showConflicts()"
+          />
+        }
+        @case ('error') {
+          <p-badge 
+            value="Error de sync"
+            severity="danger"
+          />
+        }
+      }
+      
+      @if (lastSync()) {
+        <small class="last-sync">
+          Última sync: {{ lastSync() | date:'short' }}
+        </small>
+      }
+    </div>
+  `,
+  styles: [`
+    .sync-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      
+      .last-sync {
+        color: var(--text-color-secondary);
+        font-size: 0.875rem;
+      }
+    }
+    
+    .animate-pulse {
+      animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+  `]
+})
+export class SyncStatusComponent {
+  private syncService = inject(SyncService);
+  
+  syncStatus = this.syncService.syncStatus;
+  pendingOps = this.syncService.pendingOperations;
+  lastSync = this.syncService.lastSyncTime;
+  
+  showConflicts() {
+    // TODO: Abrir modal con conflictos
+  }
+}
+```
+
+## Testing de Sincronización
+
+```typescript
+describe('SyncService', () => {
+  let service: SyncService;
+  let mockSQLite: jasmine.SpyObj<SQLiteService>;
+  let mockSupabase: jasmine.SpyObj<SupabaseService>;
+  let mockNetwork: jasmine.SpyObj<NetworkService>;
+  
+  beforeEach(() => {
+    mockSQLite = jasmine.createSpyObj('SQLiteService', ['db']);
+    mockSupabase = jasmine.createSpyObj('SupabaseService', ['from']);
+    mockNetwork = jasmine.createSpyObj('NetworkService', ['isOnline']);
+    
+    TestBed.configureTestingModule({
+      providers: [
+        SyncService,
+        { provide: SQLiteService, useValue: mockSQLite },
+        { provide: SupabaseService, useValue: mockSupabase },
+        { provide: NetworkService, useValue: mockNetwork }
+      ]
+    });
+    
+    service = TestBed.inject(SyncService);
+  });
+  
+  it('should queue operation when offline', async () => {
+    mockNetwork.isOnline.and.returnValue(false);
+    
+    await service.queueOperation({
+      operation: 'UPDATE',
+      tableName: 'daily_blocks',
+      recordId: '123',
+      payload: { status: 'completed' }
+    });
+    
+    expect(service.pendingOperations()).toBe(1);
+  });
+  
+  it('should detect conflict and register it', async () => {
+    const localData = { 
+      id: '123', 
+      status: 'completed',
+      local_updated_at: '2025-01-30T10:00:00Z'
+    };
+    
+    const serverData = {
+      id: '123',
+      status: 'skipped',
+      updated_at: '2025-01-30T11:00:00Z' // Más reciente
+    };
+    
+    mockSupabase.from.and.returnValue({
+      select: () => ({
+        eq: () => ({
+          single: () => Promise.resolve({ data: serverData, error: null })
+        })
+      })
+    } as any);
+    
+    // Debería detectar conflicto y aplicar estrategia
+    await service['syncUpdate']('daily_blocks', '123', localData);
+    
+    expect(service.syncStatus()).toBe('conflict');
+  });
+});
+```
+
+## Estrategias de Resolución de Conflictos
+
+### 1. Last-Write-Wins (Default)
+El servidor siempre gana. Sobrescribe datos locales.
+
+### 2. First-Write-Wins
+El cliente que escribió primero gana. Rechaza cambios posteriores.
+
+### 3. Manual Resolution
+Mostrar ambas versiones al usuario y que elija.
+
+```typescript
+// Componente de resolución manual
+@Component({
+  selector: 'app-conflict-resolver',
+  template: `
+    <p-dialog [(visible)]="visible" [modal]="true">
+      <h3>Conflicto detectado</h3>
+      
+      <div class="conflict-comparison">
+        <div class="local-version">
+          <h4>Tu versión (local)</h4>
+          <pre>{{ localData | json }}</pre>
+          <p-button label="Usar esta" (onClick)="resolve('local_wins')" />
+        </div>
+        
+        <div class="server-version">
+          <h4>Versión del servidor</h4>
+          <pre>{{ serverData | json }}</pre>
+          <p-button label="Usar esta" (onClick)="resolve('server_wins')" />
+        </div>
+      </div>
+    </p-dialog>
+  `
+})
+export class ConflictResolverComponent {
+  @Input() conflictId!: number;
+  @Input() localData!: any;
+  @Input() serverData!: any;
+  
+  visible = true;
+  
+  private syncService = inject(SyncService);
+  
+  async resolve(strategy: 'local_wins' | 'server_wins') {
+    await this.syncService.resolveConflict(this.conflictId, strategy);
+    this.visible = false;
+  }
+}
+```
+
+---
+
+**Versión**: 1.0.0  
+**Última actualización**: 2025-01-30  
+**Compatibilidad**: Supabase 2+, Capacitor SQLite 6+

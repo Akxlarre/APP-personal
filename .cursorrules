@@ -1,0 +1,929 @@
+# Life Blocks App - Cursor AI Rules
+# Sistema de gestión de hábitos con bloques de tiempo compartidos
+# Stack: Angular 18+ | Capacitor 6 | Supabase | PrimeNG | GSAP
+
+## 🎯 Contexto del Proyecto
+
+Esta es una aplicación móvil (Ionic/Capacitor) para estructurar la vida diaria mediante bloques de tiempo configurables.
+- Usuario principal: Programador en proceso de emprendimiento
+- Caso de uso crítico: Coordinar actividades con pareja que tiene turnos rotativos
+- Paradigma: Local-first con sincronización a Supabase
+- Filosofía: Gamificación científica (Atomic Habits + aversión a la pérdida)
+
+## 📚 Stack Tecnológico
+
+### Frontend
+- **Framework**: Angular 18+ (Standalone Components obligatorio)
+- **UI Library**: PrimeNG 18+ (usar componentes nativos, NO customizar de más)
+- **Animaciones**: GSAP 3+ (NO usar Angular Animations salvo casos específicos)
+- **State Management**: NgRx Signals (NO usar NgRx Store clásico)
+- **Mobile**: Capacitor 6 (NO usar Cordova)
+
+### Backend & Data
+- **Database**: Supabase (PostgreSQL)
+- **Auth**: Supabase Auth (email/password + OAuth social)
+- **Realtime**: Supabase Realtime Subscriptions
+- **Local Storage**: Capacitor Preferences + SQLite (offline-first)
+- **File Upload**: Supabase Storage (para avatares, futuras imágenes de comida)
+
+### Desarrollo
+- **Language**: TypeScript 5.3+ (strict mode)
+- **Build**: Vite (NO usar Webpack salvo necesidad extrema)
+- **Testing**: Vitest + Testing Library
+- **Linting**: ESLint + Prettier (configuración estricta)
+
+---
+
+## 🏗️ Arquitectura y Patrones
+
+### Estructura de Carpetas (Obligatoria)
+
+```
+src/
+├── app/
+│   ├── core/                    # Singleton services, guards, interceptors
+│   │   ├── auth/
+│   │   │   ├── guards/
+│   │   │   ├── services/
+│   │   │   └── interceptors/
+│   │   ├── supabase/
+│   │   │   ├── supabase.service.ts
+│   │   │   └── supabase.types.ts (auto-generado)
+│   │   ├── sync/
+│   │   │   ├── sync.service.ts
+│   │   │   └── sync.worker.ts
+│   │   └── notifications/
+│   │       └── notification.service.ts
+│   ├── shared/                  # Componentes, pipes, directivas reutilizables
+│   │   ├── components/
+│   │   │   ├── ui/              # Wrappers de PrimeNG si necesario
+│   │   │   └── layout/
+│   │   ├── pipes/
+│   │   ├── directives/
+│   │   ├── models/
+│   │   └── utils/
+│   ├── features/                # Módulos por funcionalidad
+│   │   ├── blocks/
+│   │   │   ├── components/
+│   │   │   ├── services/
+│   │   │   ├── stores/          # NgRx Signals
+│   │   │   └── blocks.routes.ts
+│   │   ├── templates/
+│   │   ├── habits/              # Sistema de rachas y deuda
+│   │   ├── inventory/
+│   │   ├── shared-blocks/       # Coordinación multi-usuario
+│   │   └── dashboard/
+│   ├── app.component.ts
+│   ├── app.config.ts            # Standalone config
+│   └── app.routes.ts
+├── assets/
+│   ├── i18n/                    # Español + Inglés desde v1.0
+│   ├── images/
+│   └── animations/              # GSAP timelines reutilizables
+└── environments/
+    ├── environment.ts
+    └── environment.prod.ts
+```
+
+### Convenciones de Nombrado
+
+- **Componentes**: `{feature}-{element}.component.ts` → `block-card.component.ts`
+- **Servicios**: `{domain}.service.ts` → `template.service.ts`
+- **Stores (Signals)**: `{feature}.store.ts` → `habits.store.ts`
+- **Modelos**: `{entity}.model.ts` → `daily-block.model.ts`
+- **Interfaces Supabase**: `{table}.interface.ts` → `user.interface.ts`
+
+---
+
+## 🔥 Reglas de Código Angular
+
+### 1. SIEMPRE Standalone Components
+```typescript
+// ❌ MAL - NgModules están prohibidos
+@NgModule({
+  declarations: [BlockCardComponent],
+  imports: [CommonModule]
+})
+export class BlocksModule {}
+
+// ✅ BIEN
+@Component({
+  selector: 'app-block-card',
+  standalone: true,
+  imports: [CommonModule, CardModule, ButtonModule],
+  templateUrl: './block-card.component.html',
+  changeDetection: ChangeDetectionStrategy.OnPush // OBLIGATORIO
+})
+export class BlockCardComponent {}
+```
+
+### 2. NgRx Signals para Estado Global
+```typescript
+// ✅ Store con Signals
+import { signalStore, withState, withMethods } from '@ngrx/signals';
+
+export const HabitsStore = signalStore(
+  { providedIn: 'root' },
+  withState<HabitsState>({
+    streaks: [],
+    debtedBlocks: [],
+    freezeCount: 2
+  }),
+  withMethods((store) => ({
+    addStreak(blockId: string) {
+      // Lógica inmutable
+    },
+    useFreeze() {
+      patchState(store, { freezeCount: store.freezeCount() - 1 });
+    }
+  }))
+);
+
+// ✅ Uso en componente
+export class DashboardComponent {
+  habitsStore = inject(HabitsStore);
+  
+  streaks = this.habitsStore.streaks; // Signal readonly
+}
+```
+
+### 3. Inyección de Dependencias con `inject()`
+```typescript
+// ❌ MAL - Constructor injection (legacy)
+constructor(
+  private supabase: SupabaseService,
+  private router: Router
+) {}
+
+// ✅ BIEN - Function-based injection
+export class BlockListComponent {
+  private supabase = inject(SupabaseService);
+  private router = inject(Router);
+  private route = inject(ActivatedRoute);
+  
+  // Computed signals
+  blocks = computed(() => this.supabase.blocks());
+}
+```
+
+### 4. Formularios Reactivos (NO Template-driven)
+```typescript
+// ✅ Reactive Forms con Typed Forms
+import { FormBuilder, FormGroup, Validators } from '@angular/forms';
+
+export class TemplateFormComponent {
+  private fb = inject(FormBuilder);
+  
+  templateForm = this.fb.group({
+    name: ['', [Validators.required, Validators.minLength(3)]],
+    blocks: this.fb.array([]) // FormArray para bloques dinámicos
+  });
+  
+  get blocks() {
+    return this.templateForm.get('blocks') as FormArray;
+  }
+  
+  addBlock() {
+    this.blocks.push(this.fb.group({
+      name: ['', Validators.required],
+      startTime: ['', Validators.required],
+      endTime: ['', Validators.required]
+    }));
+  }
+}
+```
+
+### 5. Change Detection Strategy OnPush (Obligatorio)
+```typescript
+@Component({
+  selector: 'app-block-card',
+  changeDetection: ChangeDetectionStrategy.OnPush, // SIEMPRE
+  // ...
+})
+```
+
+---
+
+## 🎨 PrimeNG: Reglas de Uso
+
+### Componentes Permitidos (Lista Whitelist)
+
+**Layout & Navigation**
+- `Card`, `Panel`, `Accordion`, `Divider`
+- `TabView`, `Steps` (para onboarding)
+- `Toolbar`, `Menubar` (NO usar Sidebar en móvil)
+
+**Forms**
+- `InputText`, `InputTextarea`, `InputNumber`
+- `Calendar` (para fechas de turnos)
+- `Dropdown`, `MultiSelect`
+- `Checkbox`, `RadioButton`
+- `Button`, `SplitButton`
+
+**Data Display**
+- `DataView` (para listas de bloques)
+- `Timeline` (para historial de hábitos)
+- `Tag`, `Badge` (para estados)
+- `ProgressBar`, `Meter` (para rachas)
+
+**Overlays**
+- `Dialog`, `ConfirmDialog` (para confirmaciones críticas)
+- `Toast` (notificaciones in-app)
+- `OverlayPanel` (detalles rápidos)
+
+**PROHIBIDOS en MVP**
+- `DataTable`, `TreeTable` (demasiado pesado para móvil)
+- `Chart` (usar GSAP custom o defer para v2.0)
+- `FileUpload` (usar Capacitor Camera en v2.0)
+
+### Tema y Estilos
+
+```typescript
+// angular.json - Usar tema prebuilt
+"styles": [
+  "node_modules/primeng/resources/themes/lara-dark-blue/theme.css",
+  "node_modules/primeng/resources/primeng.min.css",
+  "node_modules/primeicons/primeicons.css",
+  "src/styles.scss"
+]
+
+// src/styles.scss - Variables custom SOLO para colores de marca
+:root {
+  --primary-color: #6366f1; // Indigo (rachas activas)
+  --success-color: #10b981; // Verde (bloques completados)
+  --warning-color: #f59e0b; // Naranja (deuda de hábitos)
+  --danger-color: #ef4444;  // Rojo (racha rota)
+}
+```
+
+**Regla de Oro PrimeNG**: NO sobrescribir estilos internos de componentes. Si necesitas customización extrema, crea un wrapper component.
+
+---
+
+## ⚡ GSAP: Reglas de Animación
+
+### Cuándo Usar GSAP vs Angular Animations
+
+**Usar GSAP para:**
+- Animaciones de gamificación (fuego de rachas, explosiones de logros)
+- Transiciones complejas con timelines
+- Animaciones de scroll (parallax en dashboard)
+- Efectos de entrada/salida de modales críticos
+
+**Usar Angular Animations para:**
+- Transiciones de rutas (fade in/out)
+- Estados simples de botones (hover, disabled)
+
+### Patrón de Implementación GSAP
+
+```typescript
+// ✅ Service reutilizable de animaciones
+@Injectable({ providedIn: 'root' })
+export class AnimationService {
+  // Animación de racha completada
+  playStreakAnimation(element: HTMLElement, days: number) {
+    const tl = gsap.timeline();
+    
+    tl.to(element, {
+      scale: 1.2,
+      duration: 0.3,
+      ease: 'back.out(1.7)'
+    })
+    .to(element, {
+      rotate: 360,
+      duration: 0.5
+    })
+    .to(element, {
+      scale: 1,
+      duration: 0.2
+    });
+    
+    // Confetti si es hito (7, 30, 100 días)
+    if ([7, 30, 100].includes(days)) {
+      this.playConfetti();
+    }
+  }
+  
+  // Animación de pérdida de racha
+  playStreakLostAnimation(element: HTMLElement) {
+    gsap.to(element, {
+      opacity: 0,
+      scale: 0.5,
+      duration: 0.5,
+      ease: 'power2.in',
+      onComplete: () => {
+        gsap.set(element, { opacity: 1, scale: 1 });
+      }
+    });
+  }
+}
+
+// ✅ Uso en componente
+export class StreakBadgeComponent implements AfterViewInit {
+  @ViewChild('badge') badge!: ElementRef;
+  private animService = inject(AnimationService);
+  
+  ngAfterViewInit() {
+    // Esperar a que el elemento esté en DOM
+  }
+  
+  onStreakComplete(days: number) {
+    this.animService.playStreakAnimation(this.badge.nativeElement, days);
+  }
+}
+```
+
+### Optimización de Performance
+
+```typescript
+// ✅ Usar will-change para animaciones frecuentes
+gsap.set(element, { willChange: 'transform, opacity' });
+gsap.to(element, { x: 100, opacity: 0 });
+gsap.set(element, { willChange: 'auto' }); // Resetear después
+```
+
+---
+
+## 🗄️ Supabase: Reglas de Integración
+
+### 1. Tipos Auto-Generados (Obligatorio)
+
+```bash
+# Generar tipos desde schema
+npx supabase gen types typescript --project-id YOUR_PROJECT_ID > src/app/core/supabase/database.types.ts
+```
+
+```typescript
+// ✅ Uso de tipos generados
+import { Database } from '@core/supabase/database.types';
+
+type DailyBlock = Database['public']['Tables']['daily_blocks']['Row'];
+type DailyBlockInsert = Database['public']['Tables']['daily_blocks']['Insert'];
+type DailyBlockUpdate = Database['public']['Tables']['daily_blocks']['Update'];
+```
+
+### 2. Service Layer (Single Source of Truth)
+
+```typescript
+// src/app/core/supabase/supabase.service.ts
+@Injectable({ providedIn: 'root' })
+export class SupabaseService {
+  private supabase: SupabaseClient<Database>;
+  
+  constructor() {
+    this.supabase = createClient<Database>(
+      environment.supabaseUrl,
+      environment.supabaseAnonKey
+    );
+  }
+  
+  // Auth
+  get auth() {
+    return this.supabase.auth;
+  }
+  
+  // Realtime subscription helper
+  subscribeToTable<T extends keyof Database['public']['Tables']>(
+    table: T,
+    callback: (payload: RealtimePostgresChangesPayload<any>) => void
+  ) {
+    return this.supabase
+      .channel(`${table}_changes`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table },
+        callback
+      )
+      .subscribe();
+  }
+}
+```
+
+### 3. Repository Pattern por Entidad
+
+```typescript
+// src/app/features/blocks/services/blocks.repository.ts
+@Injectable({ providedIn: 'root' })
+export class BlocksRepository {
+  private supabase = inject(SupabaseService);
+  
+  async getDailyBlocks(userId: string, date: string): Promise<DailyBlock[]> {
+    const { data, error } = await this.supabase
+      .from('daily_blocks')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('date', date)
+      .order('start_time', { ascending: true });
+    
+    if (error) throw error;
+    return data;
+  }
+  
+  async completeBlock(blockId: string, note?: string): Promise<void> {
+    const { error } = await this.supabase
+      .from('daily_blocks')
+      .update({
+        status: 'completed',
+        completion_note: note,
+        completed_at: new Date().toISOString()
+      })
+      .eq('id', blockId);
+    
+    if (error) throw error;
+  }
+}
+```
+
+### 4. Row Level Security (RLS) - Obligatorio
+
+```sql
+-- Ejemplo de política RLS (ejecutar en Supabase SQL Editor)
+-- Users solo pueden ver sus propios bloques
+CREATE POLICY "Users can view own blocks"
+  ON daily_blocks
+  FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Users pueden ver bloques compartidos donde están invitados
+CREATE POLICY "Users can view shared blocks"
+  ON daily_blocks
+  FOR SELECT
+  USING (
+    id IN (
+      SELECT block_id FROM shared_blocks
+      WHERE invited_user_id = auth.uid() AND status = 'accepted'
+    )
+  );
+```
+
+---
+
+## 📱 Capacitor: Reglas de Integración
+
+### Plugins Esenciales (Instalar en Setup)
+
+```json
+// package.json
+{
+  "dependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/app": "^6.0.0",          // Lifecycle, deep links
+    "@capacitor/haptics": "^6.0.0",      // Vibración en confirmaciones
+    "@capacitor/local-notifications": "^6.0.0",
+    "@capacitor/preferences": "^6.0.0",  // Storage key-value
+    "@capacitor/splash-screen": "^6.0.0",
+    "@capacitor/status-bar": "^6.0.0",
+    "@capacitor-community/sqlite": "^6.0.0" // Offline DB
+  }
+}
+```
+
+### Servicio de Notificaciones Locales
+
+```typescript
+// src/app/core/notifications/notification.service.ts
+import { LocalNotifications } from '@capacitor/local-notifications';
+
+@Injectable({ providedIn: 'root' })
+export class NotificationService {
+  async scheduleBlockReminder(block: DailyBlock) {
+    const notificationTime = this.getNotificationTime(block.start_time);
+    
+    await LocalNotifications.schedule({
+      notifications: [{
+        title: `Próximo bloque: ${block.name}`,
+        body: `Comienza en 5 minutos`,
+        id: parseInt(block.id.slice(0, 8), 16), // UUID to number
+        schedule: { at: notificationTime },
+        sound: 'default',
+        actionTypeId: 'BLOCK_START',
+        extra: { blockId: block.id }
+      }]
+    });
+  }
+  
+  async requestPermissions() {
+    const result = await LocalNotifications.requestPermissions();
+    return result.display === 'granted';
+  }
+}
+```
+
+### Storage Offline (Preferences)
+
+```typescript
+// src/app/core/storage/storage.service.ts
+import { Preferences } from '@capacitor/preferences';
+
+@Injectable({ providedIn: 'root' })
+export class StorageService {
+  async set(key: string, value: any): Promise<void> {
+    await Preferences.set({
+      key,
+      value: JSON.stringify(value)
+    });
+  }
+  
+  async get<T>(key: string): Promise<T | null> {
+    const { value } = await Preferences.get({ key });
+    return value ? JSON.parse(value) : null;
+  }
+  
+  async remove(key: string): Promise<void> {
+    await Preferences.remove({ key });
+  }
+}
+```
+
+---
+
+## 🔄 Sincronización Offline-First
+
+### Estrategia de Sync
+
+```typescript
+// src/app/core/sync/sync.service.ts
+@Injectable({ providedIn: 'root' })
+export class SyncService {
+  private supabase = inject(SupabaseService);
+  private storage = inject(StorageService);
+  private network = inject(NetworkService);
+  
+  private syncQueue: SyncOperation[] = [];
+  
+  async syncDailyBlocks(userId: string, date: string) {
+    // 1. Intentar fetch de Supabase
+    if (this.network.isOnline()) {
+      try {
+        const blocks = await this.blocksRepo.getDailyBlocks(userId, date);
+        await this.storage.set(`blocks_${date}`, blocks);
+        return blocks;
+      } catch (error) {
+        console.error('Sync failed, using cache', error);
+      }
+    }
+    
+    // 2. Fallback a cache local
+    const cached = await this.storage.get<DailyBlock[]>(`blocks_${date}`);
+    return cached || [];
+  }
+  
+  async queueOperation(operation: SyncOperation) {
+    this.syncQueue.push(operation);
+    await this.storage.set('sync_queue', this.syncQueue);
+    
+    if (this.network.isOnline()) {
+      this.processSyncQueue();
+    }
+  }
+  
+  private async processSyncQueue() {
+    while (this.syncQueue.length > 0) {
+      const op = this.syncQueue[0];
+      
+      try {
+        await this.executeOperation(op);
+        this.syncQueue.shift();
+      } catch (error) {
+        console.error('Sync operation failed, retrying later', error);
+        break;
+      }
+    }
+    
+    await this.storage.set('sync_queue', this.syncQueue);
+  }
+}
+```
+
+---
+
+## 🧪 Testing: Reglas de Cobertura
+
+### Obligatorio Testear
+
+- ✅ Services (100% coverage)
+- ✅ Stores (NgRx Signals)
+- ✅ Utilities (pure functions)
+- ✅ Repositories (mocks de Supabase)
+
+### Opcional (Defer a v2.0)
+
+- ⏳ Componentes (solo críticos: forms, auth)
+- ⏳ E2E (Playwright para flujos completos)
+
+### Ejemplo de Test con Vitest
+
+```typescript
+// blocks.repository.spec.ts
+import { describe, it, expect, vi } from 'vitest';
+import { BlocksRepository } from './blocks.repository';
+
+describe('BlocksRepository', () => {
+  it('should fetch daily blocks for user', async () => {
+    const mockSupabase = {
+      from: vi.fn().mockReturnValue({
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              order: vi.fn().mockResolvedValue({
+                data: [{ id: '1', name: 'Deep Work' }],
+                error: null
+              })
+            })
+          })
+        })
+      })
+    };
+    
+    const repo = new BlocksRepository(mockSupabase as any);
+    const blocks = await repo.getDailyBlocks('user-123', '2025-01-30');
+    
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].name).toBe('Deep Work');
+  });
+});
+```
+
+---
+
+## 🚨 Reglas de Seguridad y Performance
+
+### 1. NUNCA exponer claves en frontend
+```typescript
+// ❌ MAL
+const supabase = createClient(
+  'https://abc.supabase.co',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' // Hardcoded
+);
+
+// ✅ BIEN - Variables de entorno
+import { environment } from '@env/environment';
+const supabase = createClient(
+  environment.supabaseUrl,
+  environment.supabaseAnonKey // Anon key pública OK, service_role NUNCA
+);
+```
+
+### 2. Lazy Loading de Rutas
+```typescript
+// app.routes.ts
+export const routes: Routes = [
+  {
+    path: 'blocks',
+    loadComponent: () => import('./features/blocks/block-list.component')
+      .then(m => m.BlockListComponent)
+  },
+  {
+    path: 'templates',
+    loadChildren: () => import('./features/templates/templates.routes')
+  }
+];
+```
+
+### 3. Optimización de Imágenes
+```typescript
+// ❌ NO usar <img src="..."> directo
+// ✅ Usar ngSrc con preload
+<img ngSrc="/assets/streak-fire.png" width="64" height="64" priority>
+```
+
+---
+
+## 🌍 Internacionalización (i18n)
+
+```typescript
+// Usar @ngx-translate SOLO si es crítico en v1.0
+// Para MVP, strings en español hardcodeados OK
+// Preparar estructura:
+
+// src/assets/i18n/es.json
+{
+  "blocks": {
+    "deepWork": "Trabajo Profundo",
+    "gym": "Gimnasio",
+    "ceo": "Bloque CEO"
+  },
+  "habits": {
+    "streakLost": "¡Racha perdida! 😢",
+    "streakActive": "Racha activa: {{days}} días 🔥"
+  }
+}
+```
+
+---
+
+## 📝 Commits y Versionado
+
+### Conventional Commits (Obligatorio)
+
+```
+feat(blocks): add block sharing functionality
+fix(sync): resolve conflict on concurrent updates
+docs(readme): update installation steps
+refactor(habits): extract streak logic to service
+test(inventory): add unit tests for suggestions
+chore(deps): update Angular to 18.2
+```
+
+### Branches
+
+- `main` → Producción (solo merges de release)
+- `develop` → Integración (branch de trabajo)
+- `feature/{nombre}` → Nueva funcionalidad
+- `fix/{nombre}` → Bug fix
+- `release/v1.0.0` → Preparación de release
+
+---
+
+## 🎯 Checklist Pre-Commit
+
+Antes de cada commit, verifica:
+
+- [ ] TypeScript compila sin errores (`npm run build`)
+- [ ] Linter pasa (`npm run lint`)
+- [ ] Prettier aplicado (`npm run format`)
+- [ ] Tests unitarios pasan (`npm run test`)
+- [ ] No hay `console.log` en código de producción
+- [ ] Variables de entorno en `.env.example` actualizadas
+- [ ] Imports organizados (absolute paths con `@`)
+
+---
+
+## 🚀 Comandos de Desarrollo
+
+```bash
+# Desarrollo web
+npm run start
+
+# Desarrollo móvil (sync + open)
+npm run build
+npx cap sync
+npx cap open ios    # o android
+
+# Build producción
+npm run build:prod
+npx cap copy
+npx cap sync
+
+# Testing
+npm run test        # Unit tests
+npm run test:e2e    # Playwright (v2.0)
+
+# Linting
+npm run lint
+npm run lint:fix
+npm run format
+
+# Supabase local (opcional)
+npx supabase start
+npx supabase db reset
+```
+
+---
+
+## 🎨 Filosofía de Diseño Visual
+
+### Principios UI/UX para Móvil
+
+1. **Thumb-Friendly**: Botones críticos en zona inferior (720px de altura)
+2. **Feedback Háptico**: Usar Capacitor Haptics en confirmaciones
+3. **Micro-animaciones**: GSAP para feedback visual (max 300ms)
+4. **Dark Mode First**: Tema oscuro por defecto (luz opcional v2.0)
+5. **Accesibilidad**: Contraste 4.5:1 mínimo, tamaños táctiles 44x44px
+
+### Paleta de Colores (Design Tokens)
+
+```scss
+// src/styles/tokens.scss
+$color-primary: #6366f1;    // Indigo (marca)
+$color-success: #10b981;    // Verde (completado)
+$color-warning: #f59e0b;    // Naranja (deuda)
+$color-danger: #ef4444;     // Rojo (racha rota)
+$color-neutral: #64748b;    // Gris (inactivo)
+
+$spacing-xs: 4px;
+$spacing-sm: 8px;
+$spacing-md: 16px;
+$spacing-lg: 24px;
+$spacing-xl: 32px;
+```
+
+---
+
+## 📖 Documentación Requerida
+
+Cada feature DEBE tener:
+
+1. **README.md** en carpeta de feature explicando:
+   - Propósito del módulo
+   - Componentes principales
+   - Servicios y dependencias
+   - Ejemplos de uso
+
+2. **JSDoc** en funciones públicas:
+```typescript
+/**
+ * Calcula la racha actual del bloque.
+ * @param blockId - ID único del bloque
+ * @param userId - ID del usuario
+ * @returns Número de días consecutivos completados
+ * @throws {Error} Si el bloque no existe
+ */
+async calculateStreak(blockId: string, userId: string): Promise<number> {
+  // ...
+}
+```
+
+---
+
+## ⚠️ Anti-Patrones (PROHIBIDO)
+
+### ❌ NO hacer:
+
+1. **Lógica de negocio en componentes** → Usar services
+2. **Subscriptions sin unsubscribe** → Usar `takeUntilDestroyed()`
+3. **Mutación directa de arrays/objetos** → Inmutabilidad
+4. **`any` type** → Tipar correctamente
+5. **Estilos inline en templates** → Usar clases CSS
+6. **`setTimeout` sin cleanup** → Usar RxJS `timer()`
+7. **Fetch API directa** → Usar Supabase client
+8. **Hardcodear URLs** → Usar environment variables
+
+```typescript
+// ❌ MAL
+export class BadComponent {
+  users: any; // NO
+  
+  ngOnInit() {
+    this.http.get('https://api.com/users').subscribe(data => {
+      this.users = data; // Memory leak
+    });
+  }
+}
+
+// ✅ BIEN
+export class GoodComponent {
+  private http = inject(HttpClient);
+  private destroyRef = inject(DestroyRef);
+  
+  users = signal<User[]>([]);
+  
+  ngOnInit() {
+    this.http.get<User[]>(environment.apiUrl + '/users')
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(data => this.users.set(data));
+  }
+}
+```
+
+---
+
+## 🔮 Roadmap de Features
+
+### v1.0 (MVP - 7 semanas)
+- [x] Sistema de bloques y templates
+- [x] Rachas y deuda de hábitos
+- [x] Bloques compartidos (2 usuarios)
+- [x] Inventario básico + sugerencias
+- [x] Turnos de pareja
+
+### v2.0 (Post-MVP)
+- [ ] Recetas completas con pasos
+- [ ] Análisis predictivo de productividad
+- [ ] Modo equipo (3+ usuarios)
+- [ ] Integración Google Calendar
+- [ ] Wearables (Apple Watch, Garmin)
+- [ ] AI-powered meal suggestions (OpenAI API)
+
+---
+
+## 💡 Cuando Pedir Ayuda
+
+Si encuentras:
+- Error de compilación TypeScript no resuelto en 15 min
+- Conflicto de sincronización Supabase
+- Performance issue (FPS < 30 en animaciones GSAP)
+- Bug de Capacitor en device específico
+
+Documenta:
+1. Pasos para reproducir
+2. Logs de consola
+3. Versión de librerías (`package.json`)
+4. Device/OS (si es móvil)
+
+---
+
+## 🎓 Recursos de Referencia
+
+- [Angular Best Practices](https://angular.dev/best-practices)
+- [Supabase Docs](https://supabase.com/docs)
+- [PrimeNG Components](https://primeng.org/components)
+- [GSAP Docs](https://gsap.com/docs/v3/)
+- [Capacitor Docs](https://capacitorjs.com/docs)
+- [NgRx Signals](https://ngrx.io/guide/signals)
+
+---
+
+**Última actualización**: 2025-01-30
+**Versión de reglas**: 1.0.0
+**Mantenedor**: @usuario (actualizar con tu GitHub username)
