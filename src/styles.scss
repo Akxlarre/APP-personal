@@ -1,0 +1,21 @@
+@import "primeng/resources/themes/lara-dark-blue/theme.css";
+@import "primeng/resources/primeng.css";
+@import "primeicons/primeicons.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary-color: #6366f1;
+  --surface-ground: #0f172a; // Dark background
+  --text-color: #e2e8f0;
+}
+
+body {
+  background-color: var(--surface-ground);
+  color: var(--text-color);
+  margin: 0;
+  font-family: var(--font-family);
+  -webkit-font-smoothing: antialiased;
+}
